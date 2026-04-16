@@ -3,37 +3,27 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 try {
-    # ----------------------------
-    # OOBE-safe hardening
-    # ----------------------------
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force | Out-Null
     $ConfirmPreference  = 'None'
     $ProgressPreference = 'Continue'
 
-    # ----------------------------
-    # Bootstrap NuGet + PSGallery trust
-    # ----------------------------
+    # NuGet + PSGallery trust
     if (-not (Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue)) {
         Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
     }
-
     $psg = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
     if ($psg -and $psg.InstallationPolicy -ne 'Trusted') {
         Set-PSRepository -Name PSGallery -InstallationPolicy Trusted | Out-Null
     }
 
-    # ----------------------------
-    # Install/import PSWindowsUpdate
-    # ----------------------------
+    # PSWindowsUpdate
     if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate -ErrorAction SilentlyContinue)) {
         Install-Module -Name PSWindowsUpdate -Force -SkipPublisherCheck -AllowClobber -Scope AllUsers | Out-Null
     }
     Import-Module PSWindowsUpdate -Force -ErrorAction Stop | Out-Null
 
-    # ----------------------------
     # Ensure Microsoft Update is registered (Office/other MS products)
-    # ----------------------------
     try {
         $mu = Get-WUServiceManager -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'Microsoft Update' }
         if (-not $mu) {
@@ -41,13 +31,28 @@ try {
         }
     } catch { }
 
-    function Invoke-InstallPass {
+    function Get-UpdateCount {
         param(
-            [Parameter(Mandatory)]
             [ValidateSet('Software','Driver')]
             [string]$UpdateType,
+            [bool]$Optional
+        )
+        $p = @{
+            MicrosoftUpdate = $true
+            UpdateType      = $UpdateType     # Driver vs Software. [1](https://deepwiki.com/mgajda83/PSWindowsUpdate/7.4-filtering-and-search-criteria)[2](https://www.powershellgallery.com/packages/PSWindowsUpdate/2.2.1.5)
+            IgnoreUserInput = $true
+            ErrorAction     = 'SilentlyContinue'
+        }
+        if ($Optional) { $p['BrowseOnly'] = $true }  # Optional/BrowseOnly. [1](https://deepwiki.com/mgajda83/PSWindowsUpdate/7.4-filtering-and-search-criteria)[2](https://www.powershellgallery.com/packages/PSWindowsUpdate/2.2.1.5)
+        $u = Get-WindowsUpdate @p
+        if ($u) { return $u.Count }
+        return 0
+    }
 
-            [Parameter(Mandatory)]
+    function Install-Pass {
+        param(
+            [ValidateSet('Software','Driver')]
+            [string]$UpdateType,
             [bool]$Optional
         )
 
@@ -66,10 +71,9 @@ try {
 
         $updates = Get-WindowsUpdate @scanParams
         $count = if ($updates) { $updates.Count } else { 0 }
-
         Write-Output ("Found: {0} {1} update(s)." -f $count, $class)
 
-        if ($count -eq 0) { return }
+        if ($count -eq 0) { return $false }
 
         Write-Output ("Installing: {0} {1} update(s)..." -f $count, $class)
 
@@ -84,19 +88,41 @@ try {
         }
         if ($Optional) { $installParams['BrowseOnly'] = $true }
 
-        # Use -Verbose as a switch, not inside the hashtable, to avoid parse/copy artefacts.
         Install-WindowsUpdate @installParams -Verbose | Out-Null
-
         Write-Output ("Pass complete: {0} ({1}). Rebooting if required." -f $UpdateType, $class)
+        return $true
     }
 
-    # ----------------------------
-    # Run all passes (everything)
-    # ----------------------------
-    Invoke-InstallPass -UpdateType Software -Optional:$false
-    Invoke-InstallPass -UpdateType Software -Optional:$true
-    Invoke-InstallPass -UpdateType Driver   -Optional:$false
-    Invoke-InstallPass -UpdateType Driver   -Optional:$true
+    # 1) Required software first (the important stuff)
+    Install-Pass -UpdateType Software -Optional:$false | Out-Null
+
+    # 2) Optional/Driver content often appears only after scan refresh.
+    # Retry discovery a few times before concluding "none".
+    $maxAttempts = 5
+    $sleepSeconds = 60
+
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        Write-Output ""
+        Write-Output ("Refresh cycle {0}/{1}: checking for optional/software/driver content..." -f $attempt, $maxAttempts)
+
+        $softOpt = Get-UpdateCount -UpdateType Software -Optional:$true
+        $drvReq  = Get-UpdateCount -UpdateType Driver   -Optional:$false
+        $drvOpt  = Get-UpdateCount -UpdateType Driver   -Optional:$true
+
+        Write-Output ("Detected counts: Optional Software={0}, Required Drivers={1}, Optional Drivers={2}" -f $softOpt, $drvReq, $drvOpt)
+
+        if (($softOpt + $drvReq + $drvOpt) -gt 0) { break }
+
+        if ($attempt -lt $maxAttempts) {
+            Write-Output ("Nothing yet. Waiting {0} seconds for scan results to populate..." -f $sleepSeconds)
+            Start-Sleep -Seconds $sleepSeconds
+        }
+    }
+
+    # 3) Now install the rest (everything)
+    Install-Pass -UpdateType Software -Optional:$true  | Out-Null
+    Install-Pass -UpdateType Driver   -Optional:$false | Out-Null
+    Install-Pass -UpdateType Driver   -Optional:$true  | Out-Null
 
     Write-Output ""
     Write-Output "All passes completed. Rebooting if required."
